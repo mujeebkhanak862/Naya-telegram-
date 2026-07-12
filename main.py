@@ -901,10 +901,12 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
 
 
 @app.get("/me/{user_id}/trades")
-async def get_trades(user_id: int, status: str = None, limit: int = 50, db: Session = Depends(get_db)):
+async def get_trades(user_id: int, status: str = None, chat_id: str = None, limit: int = 50, db: Session = Depends(get_db)):
     query = db.query(SignalTrade).filter(SignalTrade.user_id == user_id)
     if status:
         query = query.filter(SignalTrade.status == status)
+    if chat_id:
+        query = query.filter(SignalTrade.chat_id == chat_id)
     trades = query.order_by(SignalTrade.opened_at.desc()).limit(limit).all()
     return {
         "trades": [

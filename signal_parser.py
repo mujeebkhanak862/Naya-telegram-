@@ -5,10 +5,15 @@ pair, direction (BUY/SELL), entry, multiple TPs (TP1/TP2/TP3...), SL. Agar signa
 import re
 
 PAIR_PATTERN = re.compile(
-    r'\b([A-Z]{3,6}(?:USDT?|JPY|GBP|EUR|CAD|CHF|AUD|NZD|XAU|XAG)(?:-?OTC)?)\b',
+    r'\b([A-Z]{3,6})[\s/_-]?((?:USDT?|JPY|GBP|EUR|CAD|CHF|AUD|NZD|XAU|XAG))\s*[\s/_-]?\s*((?:OTC))?\b',
     re.IGNORECASE,
 )
-DIRECTION_PATTERN = re.compile(r'\b(BUY|SELL|CALL|PUT|LONG|SHORT)\b', re.IGNORECASE)
+# BUY/SELL/CALL/PUT/LONG/SHORT ke alawa channels ye bhi bahut use karte hain:
+# UP/DOWN, HIGHER/LOWER, HIGH/LOW, aur arrow emojis (⬆️⬇️🔼🔽📈📉🟢🔴)
+DIRECTION_PATTERN = re.compile(
+    r'(BUY|SELL|CALL|PUT|LONG|SHORT|UP|DOWN|HIGHER|LOWER|HIGH|LOW)\b|([⬆🔼📈🟢])|([⬇🔽📉🔴])',
+    re.IGNORECASE,
+)
 ENTRY_PATTERN = re.compile(r'(?:ENTRY|EP)[:\s]+([\d.]+)', re.IGNORECASE)
 # Numbered TPs: "TP1: 1.2345", "TP2 1.2350" waghera
 TP_NUMBERED_PATTERN = re.compile(r'TP\s*([1-5])[:\s]+([\d.]+)', re.IGNORECASE)
@@ -60,15 +65,21 @@ def parse_signal(text: str) -> dict | None:
     if not pair_match or not dir_match:
         return None
 
-    pair = pair_match.group(1).upper()
-    direction = dir_match.group(1).upper()
+    pair = (pair_match.group(1) + pair_match.group(2) + (pair_match.group(3) or "")).upper()
+    if dir_match.group(1):
+        direction = dir_match.group(1).upper()
+        is_buy = direction in ("BUY", "CALL", "LONG", "UP", "HIGHER", "HIGH")
+    elif dir_match.group(2):  # up-arrow emoji
+        is_buy = True
+    else:  # down-arrow emoji (group 3)
+        is_buy = False
     entry = ENTRY_PATTERN.search(text)
     tps = _extract_tps(text)
     sl = SL_PATTERN.search(text)
 
     result = {
         "pair": pair,
-        "direction": "BUY" if direction in ("BUY", "CALL", "LONG") else "SELL",
+        "direction": "BUY" if is_buy else "SELL",
         "entry": float(entry.group(1)) if entry else None,
         "sl": float(sl.group(1)) if sl else None,
         "is_otc": is_otc_pair(pair),
