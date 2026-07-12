@@ -911,7 +911,8 @@ async def get_trades(user_id: int, status: str = None, chat_id: str = None, limi
     return {
         "trades": [
             {
-                "id": t.id, "chat_title": t.chat_title, "pair": t.pair, "direction": t.direction,
+                "id": t.id, "chat_id": t.chat_id, "chat_title": t.chat_title, "pair": t.pair, "direction": t.direction,
+                "raw_text": t.raw_text,
                 "entry": t.entry, "tp": t.tp, "sl": t.sl, "is_otc": t.is_otc,
                 "tp1": t.tp1, "tp2": t.tp2, "tp3": t.tp3, "tp4": t.tp4, "tp5": t.tp5,
                 "tps_hit": t.tps_hit, "original_sl": t.original_sl,

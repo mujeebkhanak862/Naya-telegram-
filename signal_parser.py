@@ -5,7 +5,7 @@ pair, direction (BUY/SELL), entry, multiple TPs (TP1/TP2/TP3...), SL. Agar signa
 import re
 
 PAIR_PATTERN = re.compile(
-    r'\b([A-Z]{3,6})[\s/_-]?((?:USDT?|JPY|GBP|EUR|CAD|CHF|AUD|NZD|XAU|XAG))\s*[\s/_-]?\s*((?:OTC))?\b',
+    r'\b([A-Z]{3,6})[ \t/_-]?((?:USDT?|JPY|GBP|EUR|CAD|CHF|AUD|NZD|XAU|XAG))[ \t]*[ \t/_-]?[ \t]*((?:OTC))?\b',
     re.IGNORECASE,
 )
 # BUY/SELL/CALL/PUT/LONG/SHORT ke alawa channels ye bhi bahut use karte hain:
