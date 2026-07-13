@@ -27,7 +27,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError
+from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError, FloodWaitError
 from telethon.tl.types import Chat, Channel, User
 
 from db import (
@@ -120,12 +120,27 @@ async def backfill_all_chats(user_id: int, client: TelegramClient):
     bhar do pehle se, bajaye ki user khud dukaan jaaye). Sirf channels/groups
     cover karta hai (personal DMs skip - unki zaroorat nahi), aur jis chat ka
     cache already hai use dobara fetch nahi karta - taaki restart/re-login pe
-    baar-baar Telegram pe load na pade. Har chat ke beech chhota sa gap
-    (rate-limit-safe) rakhta hai taaki Telegram flood-wait trigger na ho."""
+    baar-baar Telegram pe load na pade.
+
+    SAFETY LIMITS (zaroori hai bahut saare channels wale accounts ke liye -
+    jaise 200+ channels - taaki Telegram ka rate-limit/flood-wait trigger na
+    ho aur poora app slow/stuck na pad jaaye):
+      - Ek session me max MAX_BACKFILL_CHATS channels hi cover karta hai
+      - Har channel fetch pe 15-second timeout hai (ek slow channel sabko block
+        na kare)
+      - FloodWaitError explicitly pakadta hai - agar Telegram bole ki lamba
+        wait karo, to backfill turant rok deta hai (Telegram ko force nahi
+        karta), baaki channels agli baar (agle login ya manual open) pe
+        cache ho jaayenge."""
+    MAX_BACKFILL_CHATS = 25
     await asyncio.sleep(2)  # pehle login/UI settle hone do
     db = next(get_db())
+    covered = 0
     try:
         async for dialog in client.iter_dialogs():
+            if covered >= MAX_BACKFILL_CHATS:
+                logger.info(f"User {user_id}: backfill limit ({MAX_BACKFILL_CHATS}) pooch gaya, baaki channels manually khulne pe cache honge.")
+                break
             if not (dialog.is_channel or dialog.is_group):
                 continue  # personal chats skip - sirf channels/groups cache karo
 
@@ -140,23 +155,34 @@ async def backfill_all_chats(user_id: int, client: TelegramClient):
 
             try:
                 chat_title = dialog.title or chat_id
-                async for msg in client.iter_messages(dialog.id, limit=20):
-                    media_kind = None
-                    if msg.photo: media_kind = "photo"
-                    elif msg.video: media_kind = "video"
-                    elif msg.voice: media_kind = "voice"
-                    elif msg.audio: media_kind = "audio"
-                    elif msg.sticker: media_kind = "sticker"
-                    elif msg.gif: media_kind = "gif"
-                    elif msg.document: media_kind = "document"
 
-                    db.add(SignalMessage(
-                        user_id=user_id, chat_id=chat_id, chat_title=chat_title,
-                        message_id=str(msg.id), text=msg.raw_text,
-                        has_media=msg.media is not None, media_type=media_kind,
-                        is_forwarded=bool(msg.forward), received_at=msg.date,
-                    ))
-                db.commit()
+                async def _fetch_and_store():
+                    async for msg in client.iter_messages(dialog.id, limit=20):
+                        media_kind = None
+                        if msg.photo: media_kind = "photo"
+                        elif msg.video: media_kind = "video"
+                        elif msg.voice: media_kind = "voice"
+                        elif msg.audio: media_kind = "audio"
+                        elif msg.sticker: media_kind = "sticker"
+                        elif msg.gif: media_kind = "gif"
+                        elif msg.document: media_kind = "document"
+
+                        db.add(SignalMessage(
+                            user_id=user_id, chat_id=chat_id, chat_title=chat_title,
+                            message_id=str(msg.id), text=msg.raw_text,
+                            has_media=msg.media is not None, media_type=media_kind,
+                            is_forwarded=bool(msg.forward), received_at=msg.date,
+                        ))
+                    db.commit()
+
+                await asyncio.wait_for(_fetch_and_store(), timeout=15)
+                covered += 1
+            except asyncio.TimeoutError:
+                logger.warning(f"Backfill timeout chat {chat_id} ke liye, skip karke aage badhte hain.")
+                db.rollback()
+            except FloodWaitError as e:
+                logger.warning(f"User {user_id}: Telegram flood-wait ({e.seconds}s) mila, backfill turant rok raha hoon (safety).")
+                break  # Telegram ko force nahi karna - poora backfill yahin rok do
             except Exception as e:
                 logger.warning(f"Backfill fail hua chat {chat_id} ke liye: {e}")
                 db.rollback()
@@ -825,56 +851,62 @@ async def get_chat_messages(user_id: int, chat_id: str, limit: int = 30, db: Ses
         raise HTTPException(401, "Login nahi hai ya session expire ho gayi")
 
     try:
-        try:
-            chat_entity = await client.get_entity(int(chat_id))
-            chat_title = getattr(chat_entity, "title", None) or getattr(chat_entity, "first_name", None) or chat_id
-        except Exception:
-            chat_title = chat_id
-        messages = []
-        async for msg in client.iter_messages(int(chat_id), limit=limit):
-            media_kind = None
-            if msg.photo:
-                media_kind = "photo"
-            elif msg.video:
-                media_kind = "video"
-            elif msg.voice:
-                media_kind = "voice"
-            elif msg.audio:
-                media_kind = "audio"
-            elif msg.sticker:
-                media_kind = "sticker"
-            elif msg.gif:
-                media_kind = "gif"
-            elif msg.document:
-                media_kind = "document"
+        async def _live_fetch():
+            try:
+                chat_entity = await client.get_entity(int(chat_id))
+                chat_title = getattr(chat_entity, "title", None) or getattr(chat_entity, "first_name", None) or chat_id
+            except Exception:
+                chat_title = chat_id
+            messages = []
+            async for msg in client.iter_messages(int(chat_id), limit=limit):
+                media_kind = None
+                if msg.photo:
+                    media_kind = "photo"
+                elif msg.video:
+                    media_kind = "video"
+                elif msg.voice:
+                    media_kind = "voice"
+                elif msg.audio:
+                    media_kind = "audio"
+                elif msg.sticker:
+                    media_kind = "sticker"
+                elif msg.gif:
+                    media_kind = "gif"
+                elif msg.document:
+                    media_kind = "document"
 
-            messages.append({
-                "id": msg.id,
-                "text": msg.raw_text,
-                "date": msg.date.isoformat() if msg.date else None,
-                "has_media": msg.media is not None,
-                "media_kind": media_kind,
-                "file_name": getattr(msg.file, "name", None) if msg.file else None,
-                "is_out": msg.out,
-            })
+                messages.append({
+                    "id": msg.id,
+                    "text": msg.raw_text,
+                    "date": msg.date.isoformat() if msg.date else None,
+                    "has_media": msg.media is not None,
+                    "media_kind": media_kind,
+                    "file_name": getattr(msg.file, "name", None) if msg.file else None,
+                    "is_out": msg.out,
+                })
 
-            # Cache mein backfill karo taaki agli baar isi chat ke liye Telegram
-            # call na karni pade (duplicate check message_id se).
-            exists = (
-                db.query(SignalMessage)
-                .filter(
-                    SignalMessage.user_id == user_id, SignalMessage.chat_id == chat_id,
-                    SignalMessage.message_id == str(msg.id),
-                ).first()
-            )
-            if not exists:
-                db.add(SignalMessage(
-                    user_id=user_id, chat_id=chat_id, chat_title=chat_title,
-                    message_id=str(msg.id), text=msg.raw_text,
-                    has_media=msg.media is not None, media_type=media_kind,
-                    is_forwarded=bool(msg.forward), received_at=msg.date,
-                ))
-        db.commit()
+                # Cache mein backfill karo taaki agli baar isi chat ke liye Telegram
+                # call na karni pade (duplicate check message_id se).
+                exists = (
+                    db.query(SignalMessage)
+                    .filter(
+                        SignalMessage.user_id == user_id, SignalMessage.chat_id == chat_id,
+                        SignalMessage.message_id == str(msg.id),
+                    ).first()
+                )
+                if not exists:
+                    db.add(SignalMessage(
+                        user_id=user_id, chat_id=chat_id, chat_title=chat_title,
+                        message_id=str(msg.id), text=msg.raw_text,
+                        has_media=msg.media is not None, media_type=media_kind,
+                        is_forwarded=bool(msg.forward), received_at=msg.date,
+                    ))
+            db.commit()
+            return messages
+
+        # 12-second timeout - agar Telegram slow ho ya flood-wait me ho, hamesha
+        # ke liye "Loading..." pe atke rehne ki bajaye turant cache fallback de do.
+        messages = await asyncio.wait_for(_live_fetch(), timeout=12)
         return {"messages": list(reversed(messages)), "source": "live"}
     except Exception:
         # Live fetch fail ho jaye (rate-limit, network) to jo bhi thoda-bahut
