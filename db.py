@@ -104,6 +104,7 @@ class SignalTrade(Base):
     tp3 = Column(Float, nullable=True)
     tp4 = Column(Float, nullable=True)
     tp5 = Column(Float, nullable=True)
+    tp6 = Column(Float, nullable=True)
     tps_hit = Column(Integer, default=0)  # abhi tak kitne TP hit ho chuke
     sl = Column(Float, nullable=True)  # CURRENT (trailing) stop-loss
     original_sl = Column(Float, nullable=True)  # signal me diya gaya asli SL

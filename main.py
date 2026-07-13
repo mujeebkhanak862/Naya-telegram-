@@ -110,7 +110,60 @@ async def start_listener_for_user(user: User):
 
     active_clients[user.id] = client
     asyncio.create_task(client.run_until_disconnected())
+    asyncio.create_task(backfill_all_chats(user.id, client))
     logger.info(f"User {user.id} ({user.phone}) ke liye listener shuru ho gaya.")
+
+
+async def backfill_all_chats(user_id: int, client: TelegramClient):
+    """Login hote hi background me chalta hai - taaki koi bhi channel manually
+    khole bina, sabka recent message-cache pehle se taiyaar ho jaaye (fridge
+    bhar do pehle se, bajaye ki user khud dukaan jaaye). Sirf channels/groups
+    cover karta hai (personal DMs skip - unki zaroorat nahi), aur jis chat ka
+    cache already hai use dobara fetch nahi karta - taaki restart/re-login pe
+    baar-baar Telegram pe load na pade. Har chat ke beech chhota sa gap
+    (rate-limit-safe) rakhta hai taaki Telegram flood-wait trigger na ho."""
+    await asyncio.sleep(2)  # pehle login/UI settle hone do
+    db = next(get_db())
+    try:
+        async for dialog in client.iter_dialogs():
+            if not (dialog.is_channel or dialog.is_group):
+                continue  # personal chats skip - sirf channels/groups cache karo
+
+            chat_id = str(dialog.id)
+            already_cached = (
+                db.query(SignalMessage)
+                .filter(SignalMessage.user_id == user_id, SignalMessage.chat_id == chat_id)
+                .first()
+            )
+            if already_cached:
+                continue  # is chat ka cache pehle se hai, skip karo
+
+            try:
+                chat_title = dialog.title or chat_id
+                async for msg in client.iter_messages(dialog.id, limit=20):
+                    media_kind = None
+                    if msg.photo: media_kind = "photo"
+                    elif msg.video: media_kind = "video"
+                    elif msg.voice: media_kind = "voice"
+                    elif msg.audio: media_kind = "audio"
+                    elif msg.sticker: media_kind = "sticker"
+                    elif msg.gif: media_kind = "gif"
+                    elif msg.document: media_kind = "document"
+
+                    db.add(SignalMessage(
+                        user_id=user_id, chat_id=chat_id, chat_title=chat_title,
+                        message_id=str(msg.id), text=msg.raw_text,
+                        has_media=msg.media is not None, media_type=media_kind,
+                        is_forwarded=bool(msg.forward), received_at=msg.date,
+                    ))
+                db.commit()
+            except Exception as e:
+                logger.warning(f"Backfill fail hua chat {chat_id} ke liye: {e}")
+                db.rollback()
+
+            await asyncio.sleep(1)  # Telegram rate-limit se bachne ke liye gap
+    except Exception as e:
+        logger.warning(f"Backfill loop rukk gaya user {user_id} ke liye: {e}")
 
 
 def get_or_create_demo_account(db: Session, user_id: int) -> DemoAccount:
@@ -310,6 +363,13 @@ async def handle_incoming_message(user_id: int, event, is_edit: bool):
         except Exception:
             pass
 
+    # Forward kiya hua message signal-tracking ke liye ignore karo - hum sirf
+    # channel ke apne likhe signals monitor karna chahte hain, kisi aur jagah
+    # se forward kiya gaya message nahi (chahe usme koi pair/direction jaisa
+    # text ho). Message chat mein dikhega, bas auto signal/trade nahi banega.
+    if message.forward:
+        return
+
     await process_signal_tracking(user_id, chat_id, chat_title, text, sticker_emoji=sticker_emoji)
 
 
@@ -350,7 +410,7 @@ async def process_signal_tracking(user_id: int, chat_id: str, chat_title: str, t
             pair=parsed["pair"], direction=parsed["direction"],
             entry=parsed["entry"],
             tp=parsed["tp1"], tp1=parsed["tp1"], tp2=parsed["tp2"],
-            tp3=parsed["tp3"], tp4=parsed["tp4"], tp5=parsed["tp5"],
+            tp3=parsed["tp3"], tp4=parsed["tp4"], tp5=parsed["tp5"], tp6=parsed.get("tp6"),
             tps_hit=0,
             sl=parsed["sl"], original_sl=parsed["sl"],
             is_otc=parsed["is_otc"], status="open", raw_text=text[:500],
@@ -444,7 +504,7 @@ async def price_checker_loop():
                 if price is None:
                     continue
 
-                tps = [t for t in (trade.tp1, trade.tp2, trade.tp3, trade.tp4, trade.tp5) if t is not None]
+                tps = [t for t in (trade.tp1, trade.tp2, trade.tp3, trade.tp4, trade.tp5, trade.tp6) if t is not None]
                 if not tps:
                     continue
 
@@ -729,39 +789,107 @@ async def set_chat_tracking(user_id: int, chat_id: str, payload: dict, db: Sessi
 
 
 @app.get("/me/{user_id}/chats/{chat_id}/messages")
-async def get_chat_messages(user_id: int, chat_id: str, limit: int = 50):
+async def get_chat_messages(user_id: int, chat_id: str, limit: int = 30, db: Session = Depends(get_db)):
+    """Messages ko pehle apne DB cache (SignalMessage table) se serve karta hai -
+    taaki channel dobara kholne pe turant load ho, Telegram ko dobara na poochna
+    pade. Sirf pehli baar (jab kisi chat ka cache khali ho) live Telegram se
+    fetch karta hai aur usi waqt cache mein save bhi kar deta hai, taaki agli
+    baar se instant mile. Naye messages websocket handler se already cache mein
+    aate rehte hain, isliye cache dheere-dheere khud-ba-khud up-to-date rehta hai."""
+    cached = (
+        db.query(SignalMessage)
+        .filter(SignalMessage.user_id == user_id, SignalMessage.chat_id == chat_id)
+        .order_by(SignalMessage.id.desc())
+        .limit(limit)
+        .all()
+    )
+
+    if len(cached) >= min(limit, 10):  # kaafi cache mila, Telegram call skip karo
+        messages = [
+            {
+                "id": int(m.message_id) if m.message_id.isdigit() else m.message_id,
+                "text": m.text,
+                "date": m.received_at.isoformat() if m.received_at else None,
+                "has_media": m.has_media,
+                "media_kind": m.media_type,
+                "file_name": None,
+                "is_out": False,
+            }
+            for m in reversed(cached)
+        ]
+        return {"messages": messages, "source": "cache"}
+
+    # Cache khali/kam hai (pehli baar ye chat khula hai) - Telegram se live fetch karo
     client = active_clients.get(user_id)
     if not client:
         raise HTTPException(401, "Login nahi hai ya session expire ho gayi")
 
-    messages = []
-    async for msg in client.iter_messages(int(chat_id), limit=limit):
-        media_kind = None
-        if msg.photo:
-            media_kind = "photo"
-        elif msg.video:
-            media_kind = "video"
-        elif msg.voice:
-            media_kind = "voice"
-        elif msg.audio:
-            media_kind = "audio"
-        elif msg.sticker:
-            media_kind = "sticker"
-        elif msg.gif:
-            media_kind = "gif"
-        elif msg.document:
-            media_kind = "document"
+    try:
+        try:
+            chat_entity = await client.get_entity(int(chat_id))
+            chat_title = getattr(chat_entity, "title", None) or getattr(chat_entity, "first_name", None) or chat_id
+        except Exception:
+            chat_title = chat_id
+        messages = []
+        async for msg in client.iter_messages(int(chat_id), limit=limit):
+            media_kind = None
+            if msg.photo:
+                media_kind = "photo"
+            elif msg.video:
+                media_kind = "video"
+            elif msg.voice:
+                media_kind = "voice"
+            elif msg.audio:
+                media_kind = "audio"
+            elif msg.sticker:
+                media_kind = "sticker"
+            elif msg.gif:
+                media_kind = "gif"
+            elif msg.document:
+                media_kind = "document"
 
-        messages.append({
-            "id": msg.id,
-            "text": msg.raw_text,
-            "date": msg.date.isoformat() if msg.date else None,
-            "has_media": msg.media is not None,
-            "media_kind": media_kind,
-            "file_name": getattr(msg.file, "name", None) if msg.file else None,
-            "is_out": msg.out,
-        })
-    return {"messages": list(reversed(messages))}
+            messages.append({
+                "id": msg.id,
+                "text": msg.raw_text,
+                "date": msg.date.isoformat() if msg.date else None,
+                "has_media": msg.media is not None,
+                "media_kind": media_kind,
+                "file_name": getattr(msg.file, "name", None) if msg.file else None,
+                "is_out": msg.out,
+            })
+
+            # Cache mein backfill karo taaki agli baar isi chat ke liye Telegram
+            # call na karni pade (duplicate check message_id se).
+            exists = (
+                db.query(SignalMessage)
+                .filter(
+                    SignalMessage.user_id == user_id, SignalMessage.chat_id == chat_id,
+                    SignalMessage.message_id == str(msg.id),
+                ).first()
+            )
+            if not exists:
+                db.add(SignalMessage(
+                    user_id=user_id, chat_id=chat_id, chat_title=chat_title,
+                    message_id=str(msg.id), text=msg.raw_text,
+                    has_media=msg.media is not None, media_type=media_kind,
+                    is_forwarded=bool(msg.forward), received_at=msg.date,
+                ))
+        db.commit()
+        return {"messages": list(reversed(messages)), "source": "live"}
+    except Exception:
+        # Live fetch fail ho jaye (rate-limit, network) to jo bhi thoda-bahut
+        # cache tha wahi de do, khali screen se behtar hai.
+        db.rollback()
+        messages = [
+            {
+                "id": int(m.message_id) if m.message_id.isdigit() else m.message_id,
+                "text": m.text, "date": m.received_at.isoformat() if m.received_at else None,
+                "has_media": m.has_media, "media_kind": m.media_type,
+                "file_name": None, "is_out": False,
+            }
+            for m in reversed(cached)
+        ]
+        return {"messages": messages, "source": "cache_fallback"}
 
 
 @app.get("/me/{user_id}/chats/{chat_id}/media/{message_id}")
