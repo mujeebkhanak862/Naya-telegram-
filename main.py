@@ -40,6 +40,7 @@ from signal_parser import parse_signal, parse_result_report, parse_result_from_s
 from prices import get_live_price
 from ai_analyzer import analyze_signal, test_provider_key, PROVIDER_CATALOG
 from broker_catalog import BROKER_CATALOG, CONN_TYPE_FIELDS, test_broker_connection
+from backtest_engine import fetch_binance_klines, fetch_twelvedata_candles, run_backtest, STRATEGY_CATALOG
 from credentials import get_credential_by_slot, pick_credential_for_new_login
 
 logging.basicConfig(level=logging.INFO)
@@ -1502,6 +1503,55 @@ async def test_broker_connection_endpoint(conn_id: int, db: Session = Depends(ge
     db.commit()
     db.refresh(row)
     return _serialize_broker(row)
+
+
+@app.get("/backtest/catalog")
+async def get_backtest_catalog():
+    """Saari supported strategies (UI ke dropdown ke liye)."""
+    return {"strategies": [{"key": k, "label": v["label"]} for k, v in STRATEGY_CATALOG.items()]}
+
+
+@app.post("/backtest/run")
+async def run_backtest_endpoint(payload: dict):
+    """Ek strategy ko historical candles pe chalata hai aur WIN/LOSS stats deta hai.
+    payload: {pair, source ('binance'/'twelvedata'), interval, candles, strategy, expiry_candles}"""
+    pair = (payload.get("pair") or "").strip()
+    source = payload.get("source", "binance")
+    interval = payload.get("interval", "5m")
+    num_candles = min(int(payload.get("candles", 300)), 1000)
+    strategy = payload.get("strategy", "ema_crossover")
+    expiry_candles = max(1, min(int(payload.get("expiry_candles", 3)), 20))
+
+    if not pair:
+        raise HTTPException(400, "pair zaroori hai")
+    if strategy not in STRATEGY_CATALOG:
+        raise HTTPException(400, f"Unknown strategy: {strategy}")
+
+    try:
+        if source == "binance":
+            candles = await fetch_binance_klines(pair, interval, num_candles)
+        elif source == "twelvedata":
+            api_key = os.getenv("TWELVEDATA_API_KEY")
+            if not api_key:
+                raise HTTPException(400, "TWELVEDATA_API_KEY Railway Variables me set nahi hai - forex/OTC backtest ke liye zaroori hai")
+            td_interval = {"1m": "1min", "5m": "5min", "15m": "15min", "1h": "1h"}.get(interval, "5min")
+            candles = await fetch_twelvedata_candles(pair, td_interval, num_candles, api_key)
+        else:
+            raise HTTPException(400, f"Unknown source: {source}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Candle data fetch nahi ho paya: {str(e)[:200]}")
+
+    if len(candles) < 30:
+        raise HTTPException(400, "Itna kam data mila ki backtest meaningful nahi hoga - pair/interval check karo")
+
+    result = run_backtest(candles, strategy, expiry_candles)
+    result["pair"] = pair
+    result["source"] = source
+    result["interval"] = interval
+    result["candles_used"] = len(candles)
+    return result
 
 
 @app.get("/health")
