@@ -40,7 +40,7 @@ from signal_parser import parse_signal, parse_result_report, parse_result_from_s
 from prices import get_live_price
 from ai_analyzer import analyze_signal, test_provider_key, PROVIDER_CATALOG
 from broker_catalog import BROKER_CATALOG, CONN_TYPE_FIELDS, test_broker_connection
-from backtest_engine import fetch_binance_klines, fetch_twelvedata_candles, run_backtest, STRATEGY_CATALOG
+from backtest_engine import fetch_binance_klines, fetch_twelvedata_candles, run_backtest, compare_all_strategies, STRATEGY_CATALOG
 from credentials import get_credential_by_slot, pick_credential_for_new_login
 
 logging.basicConfig(level=logging.INFO)
@@ -113,6 +113,30 @@ async def start_listener_for_user(user: User):
     asyncio.create_task(client.run_until_disconnected())
     asyncio.create_task(backfill_all_chats(user.id, client))
     logger.info(f"User {user.id} ({user.phone}) ke liye listener shuru ho gaya.")
+
+
+async def get_active_client(user_id: int, db: Session):
+    """active_clients me client dhoondta hai. Agar nahi mila (jaise Railway ne
+    backend restart/redeploy kar diya - active_clients ek in-memory dict hai,
+    restart pe khali ho jaata hai), to user ke DB me saved (encrypted) session
+    se AUTOMATICALLY reconnect karne ki koshish karta hai - taaki user ko
+    baar-baar phone-number se dobara login na karna pade sirf backend restart
+    ki wajah se. Sirf tabhi 401 deta hai jab session sach me invalid ho gaya ho
+    (jaise Telegram se kahin aur logout kar diya ho)."""
+    client = active_clients.get(user_id)
+    if client:
+        return client
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(401, "Login nahi hai ya session expire ho gayi")
+
+    logger.info(f"User {user_id}: active_clients me client nahi mila, saved session se reconnect kar raha hoon.")
+    await start_listener_for_user(user)
+    client = active_clients.get(user_id)
+    if not client:
+        raise HTTPException(401, "Session ab valid nahi hai - dobara phone number se login karo")
+    return client
 
 
 async def backfill_all_chats(user_id: int, client: TelegramClient):
@@ -631,10 +655,15 @@ async def send_code(payload: dict):
 
     cred = pick_credential_for_new_login()
     client = TelegramClient(StringSession(), cred["api_id"], cred["api_hash"])
-    await client.connect()
 
     try:
-        sent = await client.send_code_request(phone)
+        # 20-second timeout - Telegram/network slow ho to hamesha "Bhej rahe
+        # hain..." pe atkne ki bajaye turant clear error do.
+        await asyncio.wait_for(client.connect(), timeout=20)
+        sent = await asyncio.wait_for(client.send_code_request(phone), timeout=20)
+    except asyncio.TimeoutError:
+        await client.disconnect()
+        raise HTTPException(504, "Telegram se connect hone me bahut time lag raha hai - thodi der baad dobara try karo")
     except Exception as e:
         await client.disconnect()
         raise HTTPException(400, f"Code bhejne me error: {str(e)}")
@@ -715,9 +744,7 @@ async def logout(payload: dict, db: Session = Depends(get_db)):
 # ============================================================
 @app.get("/me/{user_id}/chats")
 async def get_chats(user_id: int, db: Session = Depends(get_db)):
-    client = active_clients.get(user_id)
-    if not client:
-        raise HTTPException(401, "Login nahi hai ya session expire ho gayi")
+    client = await get_active_client(user_id, db)
 
     # User ki saari custom folder/archive settings ek baar me le lo
     settings_map = {
@@ -847,9 +874,7 @@ async def get_chat_messages(user_id: int, chat_id: str, limit: int = 30, db: Ses
         return {"messages": messages, "source": "cache"}
 
     # Cache khali/kam hai (pehli baar ye chat khula hai) - Telegram se live fetch karo
-    client = active_clients.get(user_id)
-    if not client:
-        raise HTTPException(401, "Login nahi hai ya session expire ho gayi")
+    client = await get_active_client(user_id, db)
 
     try:
         async def _live_fetch():
@@ -926,11 +951,9 @@ async def get_chat_messages(user_id: int, chat_id: str, limit: int = 30, db: Ses
 
 
 @app.get("/me/{user_id}/chats/{chat_id}/media/{message_id}")
-async def get_media(user_id: int, chat_id: str, message_id: int):
+async def get_media(user_id: int, chat_id: str, message_id: int, db: Session = Depends(get_db)):
     """Ek message ki photo/sticker/media ki actual file serve karta hai."""
-    client = active_clients.get(user_id)
-    if not client:
-        raise HTTPException(401, "Login nahi hai ya session expire ho gayi")
+    client = await get_active_client(user_id, db)
 
     msg = await client.get_messages(int(chat_id), ids=message_id)
     if not msg or not msg.media:
@@ -1507,8 +1530,21 @@ async def test_broker_connection_endpoint(conn_id: int, db: Session = Depends(ge
 
 @app.get("/backtest/catalog")
 async def get_backtest_catalog():
-    """Saari supported strategies (UI ke dropdown ke liye)."""
-    return {"strategies": [{"key": k, "label": v["label"]} for k, v in STRATEGY_CATALOG.items()]}
+    """Saari supported strategies (UI ke dropdown ke liye), category ke saath."""
+    return {"strategies": [{"key": k, "label": v["label"], "category": v["category"]} for k, v in STRATEGY_CATALOG.items()]}
+
+
+async def _fetch_backtest_candles(pair: str, source: str, interval: str, num_candles: int):
+    if source == "binance":
+        return await fetch_binance_klines(pair, interval, num_candles)
+    elif source == "twelvedata":
+        api_key = os.getenv("TWELVEDATA_API_KEY")
+        if not api_key:
+            raise HTTPException(400, "TWELVEDATA_API_KEY Railway Variables me set nahi hai - forex/OTC backtest ke liye zaroori hai")
+        td_interval = {"1m": "1min", "5m": "5min", "15m": "15min", "1h": "1h"}.get(interval, "5min")
+        return await fetch_twelvedata_candles(pair, td_interval, num_candles, api_key)
+    else:
+        raise HTTPException(400, f"Unknown source: {source}")
 
 
 @app.post("/backtest/run")
@@ -1528,16 +1564,7 @@ async def run_backtest_endpoint(payload: dict):
         raise HTTPException(400, f"Unknown strategy: {strategy}")
 
     try:
-        if source == "binance":
-            candles = await fetch_binance_klines(pair, interval, num_candles)
-        elif source == "twelvedata":
-            api_key = os.getenv("TWELVEDATA_API_KEY")
-            if not api_key:
-                raise HTTPException(400, "TWELVEDATA_API_KEY Railway Variables me set nahi hai - forex/OTC backtest ke liye zaroori hai")
-            td_interval = {"1m": "1min", "5m": "5min", "15m": "15min", "1h": "1h"}.get(interval, "5min")
-            candles = await fetch_twelvedata_candles(pair, td_interval, num_candles, api_key)
-        else:
-            raise HTTPException(400, f"Unknown source: {source}")
+        candles = await _fetch_backtest_candles(pair, source, interval, num_candles)
     except HTTPException:
         raise
     except Exception as e:
@@ -1552,6 +1579,32 @@ async def run_backtest_endpoint(payload: dict):
     result["interval"] = interval
     result["candles_used"] = len(candles)
     return result
+
+
+@app.post("/backtest/compare")
+async def compare_backtest_endpoint(payload: dict):
+    """Saari 15 strategies ko SAME data pe chalake best-se-worst compare karta hai."""
+    pair = (payload.get("pair") or "").strip()
+    source = payload.get("source", "binance")
+    interval = payload.get("interval", "5m")
+    num_candles = min(int(payload.get("candles", 300)), 1000)
+    expiry_candles = max(1, min(int(payload.get("expiry_candles", 3)), 20))
+
+    if not pair:
+        raise HTTPException(400, "pair zaroori hai")
+
+    try:
+        candles = await _fetch_backtest_candles(pair, source, interval, num_candles)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Candle data fetch nahi ho paya: {str(e)[:200]}")
+
+    if len(candles) < 30:
+        raise HTTPException(400, "Itna kam data mila ki backtest meaningful nahi hoga - pair/interval check karo")
+
+    results = compare_all_strategies(candles, expiry_candles)
+    return {"pair": pair, "source": source, "interval": interval, "candles_used": len(candles), "results": results}
 
 
 @app.get("/health")

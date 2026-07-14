@@ -126,9 +126,123 @@ def bollinger_bands(values: list[float], period: int = 20, num_std: float = 2.0)
     return upper, mid, lower
 
 
-# ============================================================
-# STRATEGIES - har ek candle-index pe "BUY"/"SELL"/None signal deta hai
-# ============================================================
+def atr(candles: list[dict], period: int = 14) -> list[float | None]:
+    """Average True Range - volatility measure, Supertrend ke liye chahiye."""
+    trs = []
+    for i in range(len(candles)):
+        h, l, c = candles[i]["high"], candles[i]["low"], candles[i]["close"]
+        if i == 0:
+            trs.append(h - l)
+        else:
+            prev_c = candles[i - 1]["close"]
+            trs.append(max(h - l, abs(h - prev_c), abs(l - prev_c)))
+    out: list[float | None] = [None] * (period - 1) if len(trs) >= period else [None] * len(trs)
+    if len(trs) < period:
+        return out
+    seed = sum(trs[:period]) / period
+    out.append(seed)
+    prev = seed
+    for tr in trs[period:]:
+        prev = (prev * (period - 1) + tr) / period
+        out.append(prev)
+    return out
+
+
+def stochastic(candles: list[dict], period: int = 14, smooth: int = 3):
+    """%K aur %D lines."""
+    k_raw: list[float | None] = []
+    for i in range(len(candles)):
+        if i < period - 1:
+            k_raw.append(None)
+            continue
+        window = candles[i - period + 1:i + 1]
+        hh = max(c["high"] for c in window)
+        ll = min(c["low"] for c in window)
+        c = candles[i]["close"]
+        k_raw.append(0.0 if hh == ll else (c - ll) / (hh - ll) * 100)
+    k_clean = [v for v in k_raw if v is not None]
+    d_clean = []
+    for i in range(len(k_clean)):
+        if i < smooth - 1:
+            d_clean.append(None)
+        else:
+            window = [v for v in k_clean[i - smooth + 1:i + 1]]
+            d_clean.append(sum(window) / smooth)
+    d: list[float | None] = [None] * (len(k_raw) - len(d_clean)) + d_clean
+    return k_raw, d
+
+
+def adx(candles: list[dict], period: int = 14) -> list[float | None]:
+    """Average Directional Index - trend ki strength batata hai (direction nahi)."""
+    if len(candles) < period + 1:
+        return [None] * len(candles)
+    plus_dm, minus_dm, trs = [0.0], [0.0], [candles[0]["high"] - candles[0]["low"]]
+    for i in range(1, len(candles)):
+        up = candles[i]["high"] - candles[i - 1]["high"]
+        down = candles[i - 1]["low"] - candles[i]["low"]
+        plus_dm.append(up if (up > down and up > 0) else 0.0)
+        minus_dm.append(down if (down > up and down > 0) else 0.0)
+        h, l, pc = candles[i]["high"], candles[i]["low"], candles[i - 1]["close"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+
+    def _smooth(vals):
+        out = [None] * (period - 1)
+        seed = sum(vals[:period])
+        out.append(seed)
+        prev = seed
+        for v in vals[period:]:
+            prev = prev - (prev / period) + v
+            out.append(prev)
+        return out
+
+    smoothed_tr = _smooth(trs)
+    smoothed_plus = _smooth(plus_dm)
+    smoothed_minus = _smooth(minus_dm)
+    dx: list[float | None] = []
+    for tr, pdm, mdm in zip(smoothed_tr, smoothed_plus, smoothed_minus):
+        if tr is None or tr == 0:
+            dx.append(None)
+            continue
+        pdi = pdm / tr * 100
+        mdi = mdm / tr * 100
+        dx.append(0.0 if (pdi + mdi) == 0 else abs(pdi - mdi) / (pdi + mdi) * 100)
+    clean = [v for v in dx if v is not None]
+    if len(clean) < period:
+        return [None] * len(candles)
+    adx_seed = sum(clean[:period]) / period
+    adx_vals = [adx_seed]
+    for v in clean[period:]:
+        adx_vals.append((adx_vals[-1] * (period - 1) + v) / period)
+    return [None] * (len(candles) - len(adx_vals)) + adx_vals
+
+
+def vwap(candles: list[dict]) -> list[float]:
+    """Volume-Weighted Average Price - hamare candles me volume nahi hai, isliye
+    typical-price ka running average use karte hain (approximation)."""
+    out = []
+    cum_tp, count = 0.0, 0
+    for c in candles:
+        tp = (c["high"] + c["low"] + c["close"]) / 3
+        cum_tp += tp
+        count += 1
+        out.append(cum_tp / count)
+    return out
+
+
+def ichimoku(candles: list[dict], tenkan_period: int = 9, kijun_period: int = 26):
+    """Tenkan-sen (conversion) aur Kijun-sen (base) lines."""
+    def _mid(period, i):
+        if i < period - 1:
+            return None
+        window = candles[i - period + 1:i + 1]
+        return (max(c["high"] for c in window) + min(c["low"] for c in window)) / 2
+
+    tenkan = [_mid(tenkan_period, i) for i in range(len(candles))]
+    kijun = [_mid(kijun_period, i) for i in range(len(candles))]
+    return tenkan, kijun
+
+
+
 def _signals_ema_crossover(candles: list[dict], fast: int = 9, slow: int = 21) -> list[str | None]:
     closes = [c["close"] for c in candles]
     ema_fast = ema(closes, fast)
@@ -208,12 +322,221 @@ def _signals_candle_pattern(candles: list[dict]) -> list[str | None]:
     return signals
 
 
+def _signals_supertrend(candles: list[dict], period: int = 10, multiplier: float = 3.0) -> list[str | None]:
+    """Supertrend - trend-following, ATR-based. Trend flip pe signal deta hai.
+    Standard textbook formula use karta hai (final bands sirf tighten hote hain
+    jab tak price cross na kare, decision PREVIOUS close se hota hai)."""
+    a = atr(candles, period)
+    n = len(candles)
+    final_upper: list[float | None] = [None] * n
+    final_lower: list[float | None] = [None] * n
+    st_is_upper: list[bool | None] = [None] * n  # True = supertrend line abhi upper-band pe hai (downtrend)
+
+    for i in range(n):
+        if a[i] is None:
+            continue
+        hl2 = (candles[i]["high"] + candles[i]["low"]) / 2
+        basic_upper = hl2 + multiplier * a[i]
+        basic_lower = hl2 - multiplier * a[i]
+
+        prev_final_upper = final_upper[i - 1] if i > 0 else None
+        prev_final_lower = final_lower[i - 1] if i > 0 else None
+        prev_close = candles[i - 1]["close"] if i > 0 else None
+
+        if prev_final_upper is None:
+            final_upper[i] = basic_upper
+        else:
+            final_upper[i] = basic_upper if (basic_upper < prev_final_upper or prev_close > prev_final_upper) else prev_final_upper
+
+        if prev_final_lower is None:
+            final_lower[i] = basic_lower
+        else:
+            final_lower[i] = basic_lower if (basic_lower > prev_final_lower or prev_close < prev_final_lower) else prev_final_lower
+
+        close = candles[i]["close"]
+        prev_is_upper = st_is_upper[i - 1] if i > 0 else None
+        if prev_is_upper is None:
+            st_is_upper[i] = close <= final_upper[i]
+        elif prev_is_upper:  # abhi downtrend (upper band active)
+            st_is_upper[i] = close <= final_upper[i]
+        else:  # abhi uptrend (lower band active)
+            st_is_upper[i] = not (close >= final_lower[i])
+
+    signals: list[str | None] = [None] * n
+    for i in range(1, n):
+        if st_is_upper[i] is None or st_is_upper[i - 1] is None:
+            continue
+        if st_is_upper[i - 1] and not st_is_upper[i]:
+            signals[i] = "BUY"   # downtrend se uptrend me flip
+        elif not st_is_upper[i - 1] and st_is_upper[i]:
+            signals[i] = "SELL"  # uptrend se downtrend me flip
+    return signals
+
+
+def _signals_vwap_bounce(candles: list[dict]) -> list[str | None]:
+    """Price VWAP se door jaake wapas cross kare to signal (mean-reversion)."""
+    v = vwap(candles)
+    signals: list[str | None] = [None] * len(candles)
+    for i in range(1, len(candles)):
+        prev_c, cur_c = candles[i - 1]["close"], candles[i]["close"]
+        crossed_up = prev_c <= v[i - 1] and cur_c > v[i]
+        crossed_down = prev_c >= v[i - 1] and cur_c < v[i]
+        if crossed_up:
+            signals[i] = "BUY"
+        elif crossed_down:
+            signals[i] = "SELL"
+    return signals
+
+
+def _signals_stochastic(candles: list[dict], period: int = 14, oversold: int = 20, overbought: int = 80) -> list[str | None]:
+    k, d = stochastic(candles, period)
+    signals: list[str | None] = [None] * len(candles)
+    for i in range(1, len(candles)):
+        if k[i] is None or k[i - 1] is None:
+            continue
+        if k[i - 1] < oversold <= k[i]:
+            signals[i] = "BUY"
+        elif k[i - 1] > overbought >= k[i]:
+            signals[i] = "SELL"
+    return signals
+
+
+def _signals_adx_trend(candles: list[dict], period: int = 14, threshold: float = 25.0) -> list[str | None]:
+    """ADX strong-trend confirm karta hai, direction EMA(9) se leta hai (ADX khud direction nahi deta)."""
+    a = adx(candles, period)
+    closes = [c["close"] for c in candles]
+    fast_ema = ema(closes, 9)
+    signals: list[str | None] = [None] * len(candles)
+    for i in range(1, len(candles)):
+        if a[i] is None or a[i - 1] is None or fast_ema[i] is None:
+            continue
+        crossing_strong = a[i - 1] < threshold <= a[i]
+        if crossing_strong:
+            signals[i] = "BUY" if closes[i] > fast_ema[i] else "SELL"
+    return signals
+
+
+def _signals_support_resistance(candles: list[dict], lookback: int = 20) -> list[str | None]:
+    """Recent swing high/low (support/resistance) touch pe bounce signal."""
+    signals: list[str | None] = [None] * len(candles)
+    for i in range(lookback, len(candles)):
+        window = candles[i - lookback:i]
+        resistance = max(c["high"] for c in window)
+        support = min(c["low"] for c in window)
+        c = candles[i]
+        if c["low"] <= support and c["close"] > c["open"]:
+            signals[i] = "BUY"
+        elif c["high"] >= resistance and c["close"] < c["open"]:
+            signals[i] = "SELL"
+    return signals
+
+
+def _signals_ichimoku_cross(candles: list[dict]) -> list[str | None]:
+    """Tenkan-sen/Kijun-sen cross (TK Cross) - Ichimoku ka sabse basic signal."""
+    tenkan, kijun = ichimoku(candles)
+    signals: list[str | None] = [None] * len(candles)
+    for i in range(1, len(candles)):
+        if None in (tenkan[i], kijun[i], tenkan[i - 1], kijun[i - 1]):
+            continue
+        crossed_up = tenkan[i - 1] <= kijun[i - 1] and tenkan[i] > kijun[i]
+        crossed_down = tenkan[i - 1] >= kijun[i - 1] and tenkan[i] < kijun[i]
+        if crossed_up:
+            signals[i] = "BUY"
+        elif crossed_down:
+            signals[i] = "SELL"
+    return signals
+
+
+# ---- ICT / Smart Money Concepts (simplified, pure price-action based) ----
+
+def _signals_order_block(candles: list[dict], impulse_pct: float = 0.15) -> list[str | None]:
+    """ICT Order Block: ek strong (impulsive) move se pehle wali opposite-color
+    candle "order block" hoti hai - institution ka entry zone maana jaata hai.
+    Simplified: agla candle current se impulse_pct% se zyada move kare to
+    is candle ko order block maan ke usi direction ka signal dete hain."""
+    signals: list[str | None] = [None] * len(candles)
+    for i in range(len(candles) - 1):
+        cur, nxt = candles[i], candles[i + 1]
+        cur_bearish = cur["close"] < cur["open"]
+        cur_bullish = cur["close"] > cur["open"]
+        move_pct = abs(nxt["close"] - nxt["open"]) / nxt["open"] * 100 if nxt["open"] else 0
+        if move_pct < impulse_pct:
+            continue
+        nxt_bullish = nxt["close"] > nxt["open"]
+        if cur_bearish and nxt_bullish:
+            signals[i + 1] = "BUY"   # bullish order block confirm hua
+        elif cur_bullish and not nxt_bullish:
+            signals[i + 1] = "SELL"  # bearish order block confirm hua
+    return signals
+
+
+def _signals_fair_value_gap(candles: list[dict]) -> list[str | None]:
+    """ICT Fair Value Gap (FVG): 3-candle imbalance - candle 1 ki high/low aur
+    candle 3 ki low/high ke beech gap ho (candle 2 use nahi chhoo paati) -
+    price is gap ko "fill" karne wapas aata hai, isliye gap ki direction
+    opposite side ka signal deta hai (fill/retest trade)."""
+    signals: list[str | None] = [None] * len(candles)
+    for i in range(2, len(candles)):
+        c1, c3 = candles[i - 2], candles[i]
+        if c1["high"] < c3["low"]:
+            signals[i] = "BUY"   # bullish FVG - upar gap, retest se buy
+        elif c1["low"] > c3["high"]:
+            signals[i] = "SELL"  # bearish FVG - neeche gap, retest se sell
+    return signals
+
+
+def _signals_liquidity_sweep(candles: list[dict], lookback: int = 10) -> list[str | None]:
+    """ICT Liquidity Sweep: price recent high/low se thoda upar/neeche wick
+    banata hai (stop-loss hunt / liquidity grab) phir ulta band hota hai -
+    ye reversal ka strong signal माना jaata hai."""
+    signals: list[str | None] = [None] * len(candles)
+    for i in range(lookback, len(candles)):
+        window = candles[i - lookback:i]
+        recent_high = max(c["high"] for c in window)
+        recent_low = min(c["low"] for c in window)
+        c = candles[i]
+        swept_high = c["high"] > recent_high and c["close"] < recent_high
+        swept_low = c["low"] < recent_low and c["close"] > recent_low
+        if swept_low:
+            signals[i] = "BUY"   # neeche liquidity sweep, wapas upar close - bullish
+        elif swept_high:
+            signals[i] = "SELL"  # upar liquidity sweep, wapas neeche close - bearish
+    return signals
+
+
+def _signals_break_of_structure(candles: list[dict], lookback: int = 15) -> list[str | None]:
+    """ICT Break of Structure (BOS): price recent swing high/low ko clearly
+    break kar de (close se, sirf wick se nahi) - trend continuation/shift
+    confirm karta hai."""
+    signals: list[str | None] = [None] * len(candles)
+    for i in range(lookback, len(candles)):
+        window = candles[i - lookback:i]
+        swing_high = max(c["high"] for c in window)
+        swing_low = min(c["low"] for c in window)
+        c = candles[i]
+        if c["close"] > swing_high:
+            signals[i] = "BUY"   # bullish structure break
+        elif c["close"] < swing_low:
+            signals[i] = "SELL"  # bearish structure break
+    return signals
+
+
 STRATEGY_CATALOG = {
-    "ema_crossover": {"label": "EMA Crossover (9/21)", "fn": _signals_ema_crossover},
-    "rsi_reversal": {"label": "RSI Reversal (14, 30/70)", "fn": _signals_rsi_reversal},
-    "macd_cross": {"label": "MACD Cross", "fn": _signals_macd_cross},
-    "bollinger_bounce": {"label": "Bollinger Band Bounce", "fn": _signals_bollinger_bounce},
-    "candle_pattern": {"label": "Candle Pattern (Engulfing)", "fn": _signals_candle_pattern},
+    "ema_crossover": {"label": "EMA Crossover (9/21)", "category": "Classic", "fn": _signals_ema_crossover},
+    "rsi_reversal": {"label": "RSI Reversal (14, 30/70)", "category": "Classic", "fn": _signals_rsi_reversal},
+    "macd_cross": {"label": "MACD Cross", "category": "Classic", "fn": _signals_macd_cross},
+    "bollinger_bounce": {"label": "Bollinger Band Bounce", "category": "Classic", "fn": _signals_bollinger_bounce},
+    "candle_pattern": {"label": "Candle Pattern (Engulfing)", "category": "Classic", "fn": _signals_candle_pattern},
+    "supertrend": {"label": "Supertrend", "category": "Classic", "fn": _signals_supertrend},
+    "vwap_bounce": {"label": "VWAP Bounce", "category": "Classic", "fn": _signals_vwap_bounce},
+    "stochastic": {"label": "Stochastic (14, 20/80)", "category": "Classic", "fn": _signals_stochastic},
+    "adx_trend": {"label": "ADX Trend Strength", "category": "Classic", "fn": _signals_adx_trend},
+    "support_resistance": {"label": "Support/Resistance Bounce", "category": "Classic", "fn": _signals_support_resistance},
+    "ichimoku_cross": {"label": "Ichimoku TK Cross", "category": "Classic", "fn": _signals_ichimoku_cross},
+    "order_block": {"label": "ICT Order Block", "category": "ICT / Smart Money", "fn": _signals_order_block},
+    "fair_value_gap": {"label": "ICT Fair Value Gap (FVG)", "category": "ICT / Smart Money", "fn": _signals_fair_value_gap},
+    "liquidity_sweep": {"label": "ICT Liquidity Sweep", "category": "ICT / Smart Money", "fn": _signals_liquidity_sweep},
+    "break_of_structure": {"label": "ICT Break of Structure (BOS)", "category": "ICT / Smart Money", "fn": _signals_break_of_structure},
 }
 
 
@@ -251,7 +574,20 @@ def run_backtest(candles: list[dict], strategy: str, expiry_candles: int = 3) ->
     win_rate = round((wins / total) * 100, 1) if total else 0.0
 
     return {
-        "strategy": strategy, "strategy_label": cfg["label"],
+        "strategy": strategy, "strategy_label": cfg["label"], "category": cfg["category"],
         "total_signals": total, "wins": wins, "losses": losses, "draws": draws,
         "win_rate": win_rate, "trades": trades[-100:],  # UI ko zyada bhaari na karein
     }
+
+
+def compare_all_strategies(candles: list[dict], expiry_candles: int = 3) -> list[dict]:
+    """Saari strategies ko SAME candles pe chalata hai aur best-se-worst (win_rate
+    ke hisaab se) sorted list deta hai - taaki compare kar sako kaunsi strategy
+    is pair/timeframe pe sabse zyada profitable hai."""
+    results = []
+    for key in STRATEGY_CATALOG:
+        r = run_backtest(candles, key, expiry_candles)
+        r.pop("trades", None)  # compare view me poori trade-list nahi chahiye, halka rakho
+        results.append(r)
+    results.sort(key=lambda r: (r["win_rate"], r["total_signals"]), reverse=True)
+    return results
