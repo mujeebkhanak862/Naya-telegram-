@@ -521,6 +521,119 @@ def _signals_break_of_structure(candles: list[dict], lookback: int = 15) -> list
     return signals
 
 
+def _signals_change_of_character(candles: list[dict], lookback: int = 10) -> list[str | None]:
+    """ICT Change of Character (CHoCH): jab market lower-lows bana raha ho
+    (downtrend structure) aur achanak ek higher-high bana de, ya vice-versa -
+    ye trend ke "character" ke badalne ka pehla ishara hai (BOS se halka,
+    early-warning signal)."""
+    signals: list[str | None] = [None] * len(candles)
+    for i in range(lookback * 2, len(candles)):
+        prev_window = candles[i - lookback * 2:i - lookback]
+        cur_window = candles[i - lookback:i]
+        prev_high, prev_low = max(c["high"] for c in prev_window), min(c["low"] for c in prev_window)
+        cur_high, cur_low = max(c["high"] for c in cur_window), min(c["low"] for c in cur_window)
+        was_downtrend = cur_high < prev_high and cur_low < prev_low
+        was_uptrend = cur_high > prev_high and cur_low > prev_low
+        c = candles[i]
+        if was_downtrend and c["close"] > cur_high:
+            signals[i] = "BUY"   # downtrend tha, ab higher-high - character change bullish
+        elif was_uptrend and c["close"] < cur_low:
+            signals[i] = "SELL"  # uptrend tha, ab lower-low - character change bearish
+    return signals
+
+
+def _signals_equal_highs_lows(candles: list[dict], lookback: int = 20, tolerance_pct: float = 0.1) -> list[str | None]:
+    """ICT Equal Highs/Equal Lows (Liquidity Pool): jab 2+ swing highs/lows
+    almost same level pe ho, wahan bahut logon ka stop-loss/pending order
+    jama hota hai ("liquidity pool") - price aksar wahan jaake reverse
+    hoti hai (liquidity sweep se pehle ka setup)."""
+    signals: list[str | None] = [None] * len(candles)
+    for i in range(lookback, len(candles)):
+        window = candles[i - lookback:i]
+        highs = [c["high"] for c in window]
+        lows = [c["low"] for c in window]
+        c = candles[i]
+        top = max(highs)
+        near_equal_highs = sum(1 for h in highs if abs(h - top) / top * 100 <= tolerance_pct) >= 2
+        bottom = min(lows)
+        near_equal_lows = sum(1 for l in lows if abs(l - bottom) / bottom * 100 <= tolerance_pct) >= 2
+        if near_equal_lows and c["low"] <= bottom * 1.001 and c["close"] > c["open"]:
+            signals[i] = "BUY"   # equal-lows liquidity pool sweep, bullish reversal
+        elif near_equal_highs and c["high"] >= top * 0.999 and c["close"] < c["open"]:
+            signals[i] = "SELL"  # equal-highs liquidity pool sweep, bearish reversal
+    return signals
+
+
+def _signals_breaker_block(candles: list[dict], lookback: int = 15) -> list[str | None]:
+    """ICT Breaker Block: ek failed order block jo structure break hone ke
+    baad polarity switch kar leta hai (jo pehle resistance tha, ab support
+    ban jaata hai, ya vice-versa) - price wapas us zone pe retest karke
+    continuation deta hai."""
+    signals: list[str | None] = [None] * len(candles)
+    for i in range(lookback, len(candles) - 1):
+        window = candles[i - lookback:i]
+        swing_high = max(c["high"] for c in window)
+        swing_low = min(c["low"] for c in window)
+        c, nxt = candles[i], candles[i + 1]
+        # Structure break hua ho, phir agla candle wapas us level pe retest kare
+        if c["close"] > swing_high and nxt["low"] <= swing_high:
+            signals[i + 1] = "BUY"   # bullish breaker retest
+        elif c["close"] < swing_low and nxt["high"] >= swing_low:
+            signals[i + 1] = "SELL"  # bearish breaker retest
+    return signals
+
+
+def _signals_premium_discount(candles: list[dict], lookback: int = 30) -> list[str | None]:
+    """ICT Premium/Discount Zone (Optimal Trade Entry): recent swing range ko
+    Fibonacci se 3 zones me baantate hain - Discount (neeche 30%, buy zone),
+    Equilibrium (beech), Premium (upar 30%, sell zone). Price discount me
+    jaaye to buy, premium me jaaye to sell (institutional entry theory)."""
+    signals: list[str | None] = [None] * len(candles)
+    for i in range(lookback, len(candles)):
+        window = candles[i - lookback:i]
+        swing_high = max(c["high"] for c in window)
+        swing_low = min(c["low"] for c in window)
+        rng = swing_high - swing_low
+        if rng <= 0:
+            continue
+        c = candles[i]
+        discount_level = swing_low + rng * 0.3
+        premium_level = swing_low + rng * 0.7
+        if c["close"] <= discount_level and c["close"] > c["open"]:
+            signals[i] = "BUY"   # discount zone me bullish candle
+        elif c["close"] >= premium_level and c["close"] < c["open"]:
+            signals[i] = "SELL"  # premium zone me bearish candle
+    return signals
+
+
+def _signals_mitigation_block(candles: list[dict], lookback: int = 15) -> list[str | None]:
+    """ICT Mitigation Block: ek impulsive move ke baad, price wapas us candle
+    ke "origin" (open price) tak aata hai jahan se move shuru hua tha -
+    institutions apna baaki hua position wahan "mitigate"/complete karte
+    hain, isliye wahan se continuation expected hoti hai."""
+    signals: list[str | None] = [None] * len(candles)
+    for i in range(lookback, len(candles)):
+        # Pichhle lookback candles me sabse bada single-candle impulsive move dhoondo
+        window = candles[i - lookback:i]
+        best_idx, best_move = None, 0
+        for j, c in enumerate(window):
+            move = abs(c["close"] - c["open"])
+            if move > best_move:
+                best_move, best_idx = move, j
+        if best_idx is None or best_move == 0:
+            continue
+        origin_candle = window[best_idx]
+        was_bullish_impulse = origin_candle["close"] > origin_candle["open"]
+        c = candles[i]
+        # Price wapas origin candle ke open ke paas aaya
+        near_origin = abs(c["close"] - origin_candle["open"]) / origin_candle["open"] * 100 <= 0.15
+        if near_origin and was_bullish_impulse and c["close"] > c["open"]:
+            signals[i] = "BUY"
+        elif near_origin and not was_bullish_impulse and c["close"] < c["open"]:
+            signals[i] = "SELL"
+    return signals
+
+
 STRATEGY_CATALOG = {
     "ema_crossover": {"label": "EMA Crossover (9/21)", "category": "Classic", "fn": _signals_ema_crossover},
     "rsi_reversal": {"label": "RSI Reversal (14, 30/70)", "category": "Classic", "fn": _signals_rsi_reversal},
@@ -537,19 +650,20 @@ STRATEGY_CATALOG = {
     "fair_value_gap": {"label": "ICT Fair Value Gap (FVG)", "category": "ICT / Smart Money", "fn": _signals_fair_value_gap},
     "liquidity_sweep": {"label": "ICT Liquidity Sweep", "category": "ICT / Smart Money", "fn": _signals_liquidity_sweep},
     "break_of_structure": {"label": "ICT Break of Structure (BOS)", "category": "ICT / Smart Money", "fn": _signals_break_of_structure},
+    "change_of_character": {"label": "ICT Change of Character (CHoCH)", "category": "ICT / Smart Money", "fn": _signals_change_of_character},
+    "equal_highs_lows": {"label": "ICT Equal Highs/Lows (Liquidity Pool)", "category": "ICT / Smart Money", "fn": _signals_equal_highs_lows},
+    "breaker_block": {"label": "ICT Breaker Block", "category": "ICT / Smart Money", "fn": _signals_breaker_block},
+    "premium_discount": {"label": "ICT Premium/Discount (OTE)", "category": "ICT / Smart Money", "fn": _signals_premium_discount},
+    "mitigation_block": {"label": "ICT Mitigation Block", "category": "ICT / Smart Money", "fn": _signals_mitigation_block},
 }
 
 
-def run_backtest(candles: list[dict], strategy: str, expiry_candles: int = 3) -> dict:
+def _simulate(candles: list[dict], signals: list[str | None], expiry_candles: int) -> dict:
     """Har signal ke expiry_candles baad price check karta hai (binary-style):
     BUY signal ke baad price upar gaya to WIN, neeche gaya to LOSS. Same
     ulta SELL ke liye. Ye ek simplified fixed-expiry model hai (OTC binary
-    jaisa), pip-target wala forex-style nahi."""
-    cfg = STRATEGY_CATALOG.get(strategy)
-    if not cfg:
-        raise ValueError(f"Unknown strategy: {strategy}")
-
-    signals = cfg["fn"](candles)
+    jaisa), pip-target wala forex-style nahi. Catalog strategies aur custom
+    (user-defined) strategies dono isi ek simulator se guzarte hain."""
     trades = []
     for i, sig in enumerate(signals):
         if sig is None:
@@ -574,10 +688,112 @@ def run_backtest(candles: list[dict], strategy: str, expiry_candles: int = 3) ->
     win_rate = round((wins / total) * 100, 1) if total else 0.0
 
     return {
-        "strategy": strategy, "strategy_label": cfg["label"], "category": cfg["category"],
         "total_signals": total, "wins": wins, "losses": losses, "draws": draws,
         "win_rate": win_rate, "trades": trades[-100:],  # UI ko zyada bhaari na karein
     }
+
+
+def run_backtest(candles: list[dict], strategy: str, expiry_candles: int = 3) -> dict:
+    cfg = STRATEGY_CATALOG.get(strategy)
+    if not cfg:
+        raise ValueError(f"Unknown strategy: {strategy}")
+    signals = cfg["fn"](candles)
+    result = _simulate(candles, signals, expiry_candles)
+    result["strategy"] = strategy
+    result["strategy_label"] = cfg["label"]
+    result["category"] = cfg["category"]
+    return result
+
+
+# ============================================================
+# CUSTOM STRATEGY BUILDER - apni khud ki strategy banao (parameters set
+# karke), koi coding nahi chahiye. Har rule ek chhota building-block hai;
+# 1-3 rules ko AND se combine kar sakte ho (sab rules same direction ka
+# signal dein tabhi final signal banega).
+# ============================================================
+def _rule_ema_cross(candles: list[dict], fast: int, slow: int) -> list[str | None]:
+    return _signals_ema_crossover(candles, fast, slow)
+
+
+def _rule_rsi(candles: list[dict], period: int, oversold: int, overbought: int) -> list[str | None]:
+    return _signals_rsi_reversal(candles, period, oversold, overbought)
+
+
+def _rule_price_vs_ema(candles: list[dict], period: int) -> list[str | None]:
+    """Price EMA(period) ko cross kare - simple trend-following rule."""
+    closes = [c["close"] for c in candles]
+    e = ema(closes, period)
+    signals: list[str | None] = [None] * len(candles)
+    for i in range(1, len(candles)):
+        if e[i] is None or e[i - 1] is None:
+            continue
+        prev_c, cur_c = closes[i - 1], closes[i]
+        if prev_c <= e[i - 1] and cur_c > e[i]:
+            signals[i] = "BUY"
+        elif prev_c >= e[i - 1] and cur_c < e[i]:
+            signals[i] = "SELL"
+    return signals
+
+
+def _rule_bollinger(candles: list[dict], period: int, std_dev: float) -> list[str | None]:
+    return _signals_bollinger_bounce(candles, period, std_dev)
+
+
+def _rule_stochastic(candles: list[dict], period: int, oversold: int, overbought: int) -> list[str | None]:
+    return _signals_stochastic(candles, period, oversold, overbought)
+
+
+CUSTOM_RULE_TYPES = {
+    "ema_cross": {"label": "EMA Crossover", "fn": _rule_ema_cross,
+                  "params": {"fast": 9, "slow": 21}},
+    "rsi": {"label": "RSI Threshold", "fn": _rule_rsi,
+            "params": {"period": 14, "oversold": 30, "overbought": 70}},
+    "price_vs_ema": {"label": "Price vs EMA Cross", "fn": _rule_price_vs_ema,
+                      "params": {"period": 50}},
+    "bollinger": {"label": "Bollinger Band Bounce", "fn": _rule_bollinger,
+                  "params": {"period": 20, "std_dev": 2.0}},
+    "stochastic": {"label": "Stochastic Threshold", "fn": _rule_stochastic,
+                   "params": {"period": 14, "oversold": 20, "overbought": 80}},
+}
+
+
+def build_custom_signals(candles: list[dict], rules: list[dict]) -> list[str | None]:
+    """rules: [{"type": "ema_cross", "params": {"fast": 5, "slow": 20}}, ...]
+    Har rule apna BUY/SELL/None signal deta hai; sirf usi candle pe final
+    signal banega jahan SAARE rules EK HI direction bolein (AND logic) -
+    isse zyada confident, kam-noise wale signals milte hain jab multiple
+    rules combine karte ho."""
+    if not rules:
+        return []
+    per_rule_signals = []
+    for rule in rules:
+        rtype = rule.get("type")
+        cfg = CUSTOM_RULE_TYPES.get(rtype)
+        if not cfg:
+            raise ValueError(f"Unknown rule type: {rtype}")
+        params = {**cfg["params"], **(rule.get("params") or {})}
+        per_rule_signals.append(cfg["fn"](candles, **params))
+
+    n = len(candles)
+    final: list[str | None] = [None] * n
+    for i in range(n):
+        votes = [s[i] for s in per_rule_signals]
+        if all(v == "BUY" for v in votes):
+            final[i] = "BUY"
+        elif all(v == "SELL" for v in votes):
+            final[i] = "SELL"
+    return final
+
+
+def run_custom_backtest(candles: list[dict], rules: list[dict], expiry_candles: int = 3) -> dict:
+    signals = build_custom_signals(candles, rules)
+    result = _simulate(candles, signals, expiry_candles)
+    result["strategy"] = "custom"
+    result["strategy_label"] = "Custom Strategy (" + " + ".join(
+        CUSTOM_RULE_TYPES.get(r.get("type"), {}).get("label", r.get("type")) for r in rules
+    ) + ")"
+    result["category"] = "Custom"
+    return result
 
 
 def compare_all_strategies(candles: list[dict], expiry_candles: int = 3) -> list[dict]:

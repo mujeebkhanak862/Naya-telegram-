@@ -5,23 +5,45 @@ pair, direction (BUY/SELL), entry, multiple TPs (TP1/TP2/TP3...), SL. Agar signa
 import re
 
 # Common label/boilerplate words jo signal templates me bahut aate hain
-# (jaise "PAIR: USD/BDT", "RISK - 3%") - inhe currency-code samajhne se
-# bachne ke liye base-group se explicitly exclude karte hain.
+# (jaise "PAIR: USD/BDT", "RISK - 3%") - extra safety ke liye inhe bhi
+# explicitly exclude karte hain (whitelist ke upar defense-in-depth).
 _NON_CURRENCY_WORDS = r'PAIR\b|RISK\b|TIME\b|ALERT\b|ENTRY\b|TRADE\b|EXPIRY\b|SIGNAL\b|TARGET\b'
+
 # Majors ke alawa OTC binary channels bahut saari "exotic" currencies bhi
 # use karte hain (jaise USD/BDT, USD/INR, USD/PKR) - unhe bhi quote-side
 # list me shaamil kiya hai taaki asli pair sahi pakda jaaye.
 _EXOTIC_CCY = (
-    "BDT|INR|PKR|NGN|EGP|ZAR|TRY|BRL|IDR|PHP|VND|THB|MXN|RUB|KES|DZD|COP|"
+    "BDT|INR|PKR|NGN|EGP|ZAR|BRL|IDR|PHP|VND|THB|MXN|RUB|KES|DZD|COP|"
     "ARS|LKR|MMK|NPR|BND|MYR|SGD|HKD|CNH|CNY|KRW|SAR|AED|QAR|KWD|BHD|OMR|"
-    "JOD|LBP|UAH|PLN|CZK|HUF|RON|BGN|UGX|GHS|TZS|ETB|MAD|TND|AZN|GEL|KZT|"
-    "CLP|PEN|UYU|BOB|PYG|VES|DOP|JMD|TTD|XOF|XAF|IQD|AFN|UZS|TJS|KGS|MNT|"
-    "TWD|LAK|KHR|MDL|RSD|MKD|ALL|ISK|ZMW|MWK|MZN|BWP|NAD|SZL|LSL|SCR|MUR|"
+    "JOD|LBP|UAH|PLN|CZK|HUF|BGN|UGX|GHS|TZS|ETB|TND|AZN|GEL|KZT|"
+    "CLP|PEN|UYU|PYG|VES|DOP|JMD|TTD|XOF|XAF|IQD|AFN|UZS|TJS|KGS|MNT|"
+    "TWD|LAK|KHR|MDL|RSD|MKD|ISK|ZMW|MWK|MZN|BWP|NAD|SZL|LSL|SCR|MUR|"
     "XPT|XPD"
 )
+# NOTE: TRY (Turkish Lira), ALL (Albanian Lek), MAD (Moroccan Dirham), RON
+# (Romanian Leu), BOB (Bolivian Boliviano) jaan-boojh kar exclude kiye hain -
+# ye sab common English words/names bhi hain ("try", "for all", "so mad",
+# "Ron", "Bob") aur random prose ko galti se currency pair samajh lete the
+# (jaise "highly profitable FOR ALL members" -> galat pair "FORALL" ban raha tha).
+
+# Crypto tickers jo OTC/crypto channels "base" currency ki tarah likhte hain
+# (jaise BTCUSD, ETHUSDT). Pehle [A-Z]{3,6} se KOI bhi word match ho jaata
+# tha base ki tarah (jaise "Secret USD" -> galat pair "SECRETUSD") - ab
+# sirf inhi whitelisted codes ko hi base maana jaata hai.
+_CRYPTO_TICKERS = (
+    "BTC|ETH|SOL|XRP|DOGE|ADA|LTC|DOT|LINK|AVAX|MATIC|UNI|ATOM|NEAR|APT|"
+    "ARB|OP|SUI|TON|TRX|XLM|ALGO|FIL|SHIB|PEPE|WIF|INJ|TIA|RNDR|FET|SEI|"
+    "STX|IMX|GRT|AAVE|MKR|SAND|MANA|AXS|EOS|ICP|ETC|BCH|VET|THETA|FLOW|"
+    "EGLD|KAS|HBAR|BONK|JUP|JTO|PYTH|RAY|BNB|USDC"
+)
+# Base-currency whitelist: fiat majors + exotic fiat + crypto tickers.
+# Quote-currency whitelist: fiat majors + exotic fiat (crypto shayad hi kabhi quote hota hai).
+_BASE_CCY = f"USDT?|JPY|GBP|EUR|CAD|CHF|AUD|NZD|XAU|XAG|{_EXOTIC_CCY}|{_CRYPTO_TICKERS}"
+_QUOTE_CCY = f"USDT?|JPY|GBP|EUR|CAD|CHF|AUD|NZD|XAU|XAG|{_EXOTIC_CCY}"
+
 PAIR_PATTERN = re.compile(
-    rf'\b(?!{_NON_CURRENCY_WORDS})([A-Z]{{3,6}})[ \t]*[/_-]?[ \t]*'
-    rf'((?:USDT?|JPY|GBP|EUR|CAD|CHF|AUD|NZD|XAU|XAG|{_EXOTIC_CCY}))'
+    rf'\b(?!{_NON_CURRENCY_WORDS})((?:{_BASE_CCY}))[ \t]*[/_-]?[ \t]*'
+    rf'((?:{_QUOTE_CCY}))'
     rf'[ \t]*[/_\-\(\[]*[ \t]*((?:OTC))?[\)\]]*\b',
     re.IGNORECASE,
 )

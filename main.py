@@ -40,7 +40,10 @@ from signal_parser import parse_signal, parse_result_report, parse_result_from_s
 from prices import get_live_price
 from ai_analyzer import analyze_signal, test_provider_key, PROVIDER_CATALOG
 from broker_catalog import BROKER_CATALOG, CONN_TYPE_FIELDS, test_broker_connection
-from backtest_engine import fetch_binance_klines, fetch_twelvedata_candles, run_backtest, compare_all_strategies, STRATEGY_CATALOG
+from backtest_engine import (
+    fetch_binance_klines, fetch_twelvedata_candles, run_backtest, compare_all_strategies,
+    run_custom_backtest, build_custom_signals, STRATEGY_CATALOG, CUSTOM_RULE_TYPES,
+)
 from credentials import get_credential_by_slot, pick_credential_for_new_login
 
 logging.basicConfig(level=logging.INFO)
@@ -1605,6 +1608,114 @@ async def compare_backtest_endpoint(payload: dict):
 
     results = compare_all_strategies(candles, expiry_candles)
     return {"pair": pair, "source": source, "interval": interval, "candles_used": len(candles), "results": results}
+
+
+@app.get("/backtest/custom-rule-types")
+async def get_custom_rule_types():
+    """Custom Strategy Builder ke liye available building-blocks (UI form banane ke liye)."""
+    return {
+        "rule_types": [
+            {"key": k, "label": v["label"], "params": v["params"]}
+            for k, v in CUSTOM_RULE_TYPES.items()
+        ]
+    }
+
+
+@app.post("/backtest/custom-run")
+async def run_custom_backtest_endpoint(payload: dict):
+    """User ki apni banayi hui strategy (1-3 rules, AND se combined) ko
+    historical data pe test karta hai.
+    payload: {pair, source, interval, candles, expiry_candles, rules: [{type, params}]}"""
+    pair = (payload.get("pair") or "").strip()
+    source = payload.get("source", "binance")
+    interval = payload.get("interval", "5m")
+    num_candles = min(int(payload.get("candles", 300)), 1000)
+    expiry_candles = max(1, min(int(payload.get("expiry_candles", 3)), 20))
+    rules = payload.get("rules") or []
+
+    if not pair:
+        raise HTTPException(400, "pair zaroori hai")
+    if not rules:
+        raise HTTPException(400, "Kam se kam 1 rule chahiye strategy banane ke liye")
+    for r in rules:
+        if r.get("type") not in CUSTOM_RULE_TYPES:
+            raise HTTPException(400, f"Unknown rule type: {r.get('type')}")
+
+    try:
+        candles = await _fetch_backtest_candles(pair, source, interval, num_candles)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Candle data fetch nahi ho paya: {str(e)[:200]}")
+
+    if len(candles) < 30:
+        raise HTTPException(400, "Itna kam data mila ki backtest meaningful nahi hoga - pair/interval check karo")
+
+    try:
+        result = run_custom_backtest(candles, rules, expiry_candles)
+    except Exception as e:
+        raise HTTPException(400, f"Strategy chalane me error: {str(e)[:200]}")
+    result["pair"] = pair
+    result["source"] = source
+    result["interval"] = interval
+    result["candles_used"] = len(candles)
+    return result
+
+
+@app.post("/backtest/live-signal")
+async def get_live_signal(payload: dict, db: Session = Depends(get_db)):
+    """Abhi ke latest candles pe strategy chalake batata hai ki IS MOMENT
+    kya signal hai (BUY/SELL/koi signal nahi) - taaki backtest ki strategy
+    ko real trading me bhi use kar sako. Agar chaho to isi signal se
+    turant demo trade bhi khol sakte ho (frontend 'Trade Karo' button se).
+    payload: {pair, source, interval, strategy (catalog key) YA rules (custom)}"""
+    pair = (payload.get("pair") or "").strip()
+    source = payload.get("source", "binance")
+    interval = payload.get("interval", "5m")
+    strategy = payload.get("strategy")
+    rules = payload.get("rules")
+
+    if not pair:
+        raise HTTPException(400, "pair zaroori hai")
+    if not strategy and not rules:
+        raise HTTPException(400, "strategy ya rules me se ek chahiye")
+
+    try:
+        candles = await _fetch_backtest_candles(pair, source, interval, 100)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Candle data fetch nahi ho paya: {str(e)[:200]}")
+
+    if len(candles) < 30:
+        raise HTTPException(400, "Itna kam data mila - pair/interval check karo")
+
+    if strategy:
+        cfg = STRATEGY_CATALOG.get(strategy)
+        if not cfg:
+            raise HTTPException(400, f"Unknown strategy: {strategy}")
+        signals = cfg["fn"](candles)
+        label = cfg["label"]
+    else:
+        signals = build_custom_signals(candles, rules)
+        label = "Custom Strategy"
+
+    # Sabse aakhri candle jahan koi signal tha, wahi "abhi ka" signal hai
+    latest_signal, latest_idx = None, None
+    for i in range(len(signals) - 1, -1, -1):
+        if signals[i] is not None:
+            latest_signal, latest_idx = signals[i], i
+            break
+
+    is_fresh = latest_idx is not None and latest_idx >= len(candles) - 3  # last 3 candles ke andar hi "fresh" maana
+    return {
+        "pair": pair, "strategy_label": label,
+        "current_price": candles[-1]["close"],
+        "signal": latest_signal if is_fresh else None,
+        "signal_time": candles[latest_idx]["time"] if latest_idx is not None else None,
+        "signal_price": candles[latest_idx]["close"] if latest_idx is not None else None,
+        "candles_checked": len(candles),
+    }
 
 
 @app.get("/health")
