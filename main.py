@@ -161,7 +161,7 @@ async def backfill_all_chats(user_id: int, client: TelegramClient):
         karta), baaki channels agli baar (agle login ya manual open) pe
         cache ho jaayenge."""
     MAX_BACKFILL_CHATS = 25
-    await asyncio.sleep(2)  # pehle login/UI settle hone do
+    await asyncio.sleep(15)  # pehle login/chat-list load ho jaane do, phir background backfill shuru ho (taaki connection contend na kare)
     db = next(get_db())
     covered = 0
     try:
@@ -691,41 +691,49 @@ async def verify_code(payload: dict, db: Session = Depends(get_db)):
 
     client: TelegramClient = pending["client"]
     try:
+        async def _do_verify():
+            try:
+                await client.sign_in(phone, code, phone_code_hash=pending["phone_code_hash"])
+            except SessionPasswordNeededError:
+                if not password:
+                    return {"status": "2fa_required"}
+                await client.sign_in(password=password)
+            except (PhoneCodeInvalidError, PhoneCodeExpiredError):
+                raise HTTPException(400, "OTP galat ya expire ho gaya, dobara try karo")
+
+            me = await client.get_me()
+            session_str = client.session.save()
+
+            user = db.query(User).filter(User.phone == phone).first()
+            if not user:
+                user = User(phone=phone)
+                db.add(user)
+
+            user.telegram_user_id = str(me.id)
+            user.display_name = f"{me.first_name or ''} {me.last_name or ''}".strip()
+            user.username = me.username
+            user.encrypted_session = encrypt_session(session_str)
+            user.credential_slot = pending["credential_slot"]
+            user.last_login = datetime.utcnow()
+            db.commit()
+            db.refresh(user)
+
+            del pending_logins[phone]
+            await start_listener_for_user(user)
+
+            return {
+                "status": "success",
+                "user_id": user.id,
+                "display_name": user.display_name,
+                "username": user.username,
+            }
+
+        # 25-second timeout - Telegram/network slow ho to hamesha "Verify ho
+        # raha hai..." pe atkne ki bajaye turant clear error do.
         try:
-            await client.sign_in(phone, code, phone_code_hash=pending["phone_code_hash"])
-        except SessionPasswordNeededError:
-            if not password:
-                return {"status": "2fa_required"}
-            await client.sign_in(password=password)
-        except (PhoneCodeInvalidError, PhoneCodeExpiredError):
-            raise HTTPException(400, "OTP galat ya expire ho gaya, dobara try karo")
-
-        me = await client.get_me()
-        session_str = client.session.save()
-
-        user = db.query(User).filter(User.phone == phone).first()
-        if not user:
-            user = User(phone=phone)
-            db.add(user)
-
-        user.telegram_user_id = str(me.id)
-        user.display_name = f"{me.first_name or ''} {me.last_name or ''}".strip()
-        user.username = me.username
-        user.encrypted_session = encrypt_session(session_str)
-        user.credential_slot = pending["credential_slot"]
-        user.last_login = datetime.utcnow()
-        db.commit()
-        db.refresh(user)
-
-        del pending_logins[phone]
-        await start_listener_for_user(user)
-
-        return {
-            "status": "success",
-            "user_id": user.id,
-            "display_name": user.display_name,
-            "username": user.username,
-        }
+            return await asyncio.wait_for(_do_verify(), timeout=25)
+        except asyncio.TimeoutError:
+            raise HTTPException(504, "Telegram se connect hone me bahut time lag raha hai - thodi der baad dobara try karo")
     except HTTPException:
         raise
     except Exception as e:
@@ -754,31 +762,40 @@ async def get_chats(user_id: int, db: Session = Depends(get_db)):
         s.chat_id: s for s in db.query(ChatSettings).filter(ChatSettings.user_id == user_id).all()
     }
 
-    chats = []
-    async for dialog in client.iter_dialogs():
-        entity = dialog.entity
-        is_group = isinstance(entity, Chat) or (isinstance(entity, Channel) and getattr(entity, "megagroup", False))
-        is_channel = isinstance(entity, Channel) and not getattr(entity, "megagroup", False)
+    async def _fetch_dialogs():
+        chats = []
+        async for dialog in client.iter_dialogs():
+            entity = dialog.entity
+            is_group = isinstance(entity, Chat) or (isinstance(entity, Channel) and getattr(entity, "megagroup", False))
+            is_channel = isinstance(entity, Channel) and not getattr(entity, "megagroup", False)
 
-        last_msg = dialog.message
-        chat_id_str = str(dialog.id)
-        setting = settings_map.get(chat_id_str)
+            last_msg = dialog.message
+            chat_id_str = str(dialog.id)
+            setting = settings_map.get(chat_id_str)
 
-        chats.append({
-            "id": chat_id_str,
-            "title": dialog.name,
-            "is_group": is_group,
-            "is_channel": is_channel,
-            "unread_count": dialog.unread_count,
-            "last_message": last_msg.text if last_msg else None,
-            "last_message_date": dialog.date.isoformat() if dialog.date else None,
-            "last_message_id": last_msg.id if last_msg else None,
-            "last_message_has_media": bool(last_msg.media) if last_msg else False,
-            "folder": setting.folder if setting else None,
-            "archived": setting.archived if setting else False,
-            "track_signals": setting.track_signals if setting else True,
-            "auto_trade": setting.auto_trade if setting else False,
-        })
+            chats.append({
+                "id": chat_id_str,
+                "title": dialog.name,
+                "is_group": is_group,
+                "is_channel": is_channel,
+                "unread_count": dialog.unread_count,
+                "last_message": last_msg.text if last_msg else None,
+                "last_message_date": dialog.date.isoformat() if dialog.date else None,
+                "last_message_id": last_msg.id if last_msg else None,
+                "last_message_has_media": bool(last_msg.media) if last_msg else False,
+                "folder": setting.folder if setting else None,
+                "archived": setting.archived if setting else False,
+                "track_signals": setting.track_signals if setting else True,
+                "auto_trade": setting.auto_trade if setting else False,
+            })
+        return chats
+
+    try:
+        # 25-second timeout - agar Telegram slow ho ya backfill ke saath
+        # connection busy ho, hamesha ke liye latakne ki bajaye clear error do.
+        chats = await asyncio.wait_for(_fetch_dialogs(), timeout=25)
+    except asyncio.TimeoutError:
+        raise HTTPException(504, "Chats load karne me bahut time lag raha hai - thodi der baad dobara try karo")
     return {"chats": chats}
 
 
