@@ -85,21 +85,10 @@ RESULT_KEYWORDS = {
 # Binary options (OTC) channels result ka elaan aksar text ki jagah sirf ek
 # Telegram STICKER se karte hain (koi caption/text nahi hota). Telethon me
 # har sticker ke saath ek emoji attached hoti hai (msg.file.emoji) - usi se
-# match karte hain. Ye list thodi broad rakhi hai kyunki sticker ek DELIBERATE,
-# akela emoji hota hai (prose scan nahi) - false-positive risk yahan nahi hota.
+# match karte hain. Naye emoji mile to yahan add kar sakte ho.
 STICKER_WIN_EMOJIS = {"✅", "💚", "🟢", "👍", "🎯", "💰", "🥳", "🔥", "💵", "✔️", "☑️"}
 STICKER_LOSS_EMOJIS = {"❌", "🔴", "👎", "💔", "🚫", "😢", "😭", "🥀", "⛔", "✖️"}
 STICKER_SKIP_EMOJIS = {"⏭️", "🔁", "⚪", "🤍", "➖", "⏸️"}
-
-# TEXT messages scan karne ke liye ALAG (chhoti) list - sirf wahi emojis jo
-# trading context ke bahar shayad hi kabhi aate hain. Generic hype emojis
-# jaise 🔥🎯💰👍😢🚫 yahan JAAN-BOOJH KAR nahi hain, kyunki promotional/spam
-# messages (jaise "🔥 highly profitable for all members! 💥") in emojis ko
-# bahut use karte hain - agar ek open trade ho aur aisa message aa jaaye, to
-# ye galti se "WIN" maan ke trade close kar deta tha (real bug tha).
-TEXT_RESULT_WIN_EMOJIS = {"✅", "🟢", "💚"}
-TEXT_RESULT_LOSS_EMOJIS = {"❌", "🔴"}
-TEXT_RESULT_SKIP_EMOJIS = {"⚪"}
 
 MAX_TPS = 6
 
@@ -174,11 +163,11 @@ def parse_result_report(text: str) -> str | None:
         if re.search(rf'\b{re.escape(keyword)}\b', lower):
             return RESULT_KEYWORDS[keyword]
     for ch in text:
-        if ch in TEXT_RESULT_WIN_EMOJIS:
+        if ch in STICKER_WIN_EMOJIS:
             return "win"
-        if ch in TEXT_RESULT_LOSS_EMOJIS:
+        if ch in STICKER_LOSS_EMOJIS:
             return "loss"
-        if ch in TEXT_RESULT_SKIP_EMOJIS:
+        if ch in STICKER_SKIP_EMOJIS:
             return "skip"
     return None
 
